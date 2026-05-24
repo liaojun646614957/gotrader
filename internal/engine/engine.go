@@ -27,14 +27,15 @@ import (
 
 // Engine 主循环。
 type Engine struct {
-	rest      *okx.Client
-	wsPub     *okx.WSClient // 行情（trades）
-	wsBiz     *okx.WSClient // K 线（candle 频道在 business 端）
-	wsPriv    *okx.WSClient // 订单 / 持仓
-	risk      *RiskGuard
-	strat     strategy.Strategy
-	stratCfg  strategy.Config
-	notifier  notify.Notifier // 信号 / 下单事件的邮件通知。无配置时为 Noop。
+	rest         *okx.Client
+	wsPub        *okx.WSClient // 行情（trades）
+	wsBiz        *okx.WSClient // K 线（candle 频道在 business 端）
+	wsPriv       *okx.WSClient // 订单 / 持仓
+	risk         *RiskGuard
+	strat        strategy.Strategy
+	stratCfg     strategy.Config
+	notifier     notify.Notifier // 信号 / 下单事件的邮件通知。无配置时为 Noop。
+	positionMode string          // "net"（单向，OKX 默认）/ "long_short"（双向）。决定下单是否带 posSide。
 
 	// 市场状态缓存：最新成交价、持仓金额
 	mu             sync.RWMutex
@@ -43,11 +44,15 @@ type Engine struct {
 }
 
 // New 构造 Engine。notifier 传 nil 等价于 notify.Noop{}（永远不会 panic）。
+// positionMode 留空 → 默认 "net"（单向持仓）。
 func New(rest *okx.Client, wsPub, wsBiz, wsPriv *okx.WSClient,
 	risk *RiskGuard, strat strategy.Strategy, stratCfg strategy.Config,
-	notifier notify.Notifier) *Engine {
+	notifier notify.Notifier, positionMode string) *Engine {
 	if notifier == nil {
 		notifier = notify.Noop{}
+	}
+	if positionMode == "" {
+		positionMode = "net"
 	}
 	return &Engine{
 		rest:          rest,
@@ -58,6 +63,7 @@ func New(rest *okx.Client, wsPub, wsBiz, wsPriv *okx.WSClient,
 		strat:         strat,
 		stratCfg:      stratCfg,
 		notifier:      notifier,
+		positionMode:  positionMode,
 		lastPrice:     make(map[string]float64),
 		positionValue: make(map[string]float64),
 	}
@@ -193,7 +199,12 @@ func (e *Engine) handleEvent(ev okx.WSEvent) {
 	}
 }
 
-func (e *Engine) handleSignal(sig types.Signal) {
+// handleSignal 处理一个策略信号：风控 → 下单 → 通知。
+// 返回 nil 表示 OKX 成功接单（订单 ID 已拿到），非 nil 表示风控拦截 / OKX 拒单 / 网络失败。
+//
+// Run 模式的调用方可以忽略返回值（已在内部 slog 打错误日志）；
+// oneshot 模式用返回值统计成功/失败下单数，给最终决策报告用。
+func (e *Engine) handleSignal(sig types.Signal) error {
 	e.mu.RLock()
 	mark := e.lastPrice[sig.InstID]
 	posVal := e.positionValue[sig.InstID]
@@ -205,7 +216,7 @@ func (e *Engine) handleSignal(sig types.Signal) {
 			fmt.Sprintf("[gotrader] 信号被风控拦截 %s %s", sig.InstID, sig.Side),
 			formatSignalNotify(sig, mark, posVal, "BLOCKED", "风控拒绝："+err.Error(), "", ""),
 		)
-		return
+		return fmt.Errorf("blocked by risk: %w", err)
 	}
 
 	tdMode := tradeMode(sig.InstType)
@@ -215,11 +226,20 @@ func (e *Engine) handleSignal(sig types.Signal) {
 	// 必须用合约面值 ctVal 转换。这里用静态表，未来改成启动时拉 /api/v5/public/instruments
 	okxSize := convertToOKXSize(sig.InstID, sig.InstType, sig.Size)
 
+	// posSide 适配账户持仓模式：
+	//   - net 模式（OKX 默认单向持仓）：必须不传 posSide，否则 51000 拒单
+	//   - long_short 模式（双向持仓）：必须传 long/short
+	// 策略层统一发 long/short，由这里按账户实际模式做翻译。
+	posSide := sig.PosSide
+	if e.positionMode == "net" {
+		posSide = types.PosNone
+	}
+
 	req := okx.PlaceOrderReq{
 		InstID:     sig.InstID,
 		TdMode:     tdMode,
 		Side:       sig.Side,
-		PosSide:    sig.PosSide,
+		PosSide:    posSide,
 		Type:       sig.Type,
 		Price:      sig.Price,
 		Size:       okxSize,
@@ -233,7 +253,7 @@ func (e *Engine) handleSignal(sig types.Signal) {
 			fmt.Sprintf("[gotrader] 下单失败 %s %s", sig.InstID, sig.Side),
 			formatSignalNotify(sig, mark, posVal, "FAIL", "下单失败："+err.Error(), clOID, ""),
 		)
-		return
+		return fmt.Errorf("place order: %w", err)
 	}
 	slog.Info("订单已下", "instId", sig.InstID, "side", sig.Side,
 		"strategy_size", sig.Size, "okx_size", okxSize,
@@ -243,6 +263,7 @@ func (e *Engine) handleSignal(sig types.Signal) {
 		fmt.Sprintf("[gotrader] 已下单 %s %s %s", sig.InstID, describeAction(sig), sig.Side),
 		formatSignalNotify(sig, mark, posVal, "OK", "订单已提交", clOID, orderID),
 	)
+	return nil
 }
 
 // describeAction 把信号翻译成人话："开多" / "平多" / "开空" / "平空"。

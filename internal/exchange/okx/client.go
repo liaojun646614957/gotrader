@@ -97,9 +97,38 @@ func (c *Client) request(method, path string, query map[string]string, body inte
 		return nil, fmt.Errorf("decode resp: %w (raw=%s)", err, string(raw))
 	}
 	if ar.Code != "0" {
-		return nil, fmt.Errorf("okx error: code=%s msg=%s", ar.Code, ar.Msg)
+		// OKX 批量接口（包括下单）顶层 code=1 表示"有失败"，真因藏在 data 数组里。
+		// 把 data 原文带出来，否则只看顶层会得到一句没意义的 "All operations failed"。
+		detail := extractFirstFailure(ar.Data)
+		if detail != "" {
+			return nil, fmt.Errorf("okx error: code=%s msg=%s | %s", ar.Code, ar.Msg, detail)
+		}
+		return nil, fmt.Errorf("okx error: code=%s msg=%s data=%s",
+			ar.Code, ar.Msg, string(ar.Data))
 	}
 	return ar.Data, nil
+}
+
+// extractFirstFailure 从 OKX data 数组里挑第一个 sCode != "0" 的子项作详细错误。
+// 形如 [{"sCode":"51008","sMsg":"Order amount ..."}, ...]。
+// 不能解析就返回空串，由调用方退回到打印原始 data。
+func extractFirstFailure(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var items []struct {
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &items); err != nil {
+		return ""
+	}
+	for _, it := range items {
+		if it.SCode != "" && it.SCode != "0" {
+			return fmt.Sprintf("sCode=%s sMsg=%s", it.SCode, it.SMsg)
+		}
+	}
+	return ""
 }
 
 func encodeQuery(q map[string]string) string {

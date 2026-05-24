@@ -100,16 +100,10 @@ func (s *tsmom) WarmupBars() int {
 func (s *tsmom) OnTick(t types.Tick) {}
 
 func (s *tsmom) OnKline(k types.Kline) {
-	s.closes = append(s.closes, k.Close)
-	// 滚动保留（不需要太长）
-	if len(s.closes) > s.lookbackBars*4 {
-		s.closes = s.closes[len(s.closes)-s.lookbackBars*4:]
-	}
-
+	s.appendClose(k.Close)
 	s.barsSinceEval++
 
-	// 数据不足
-	if len(s.closes) < s.lookbackBars+1 {
+	if !s.hasEnoughData() {
 		return
 	}
 	// 持有期未到
@@ -117,8 +111,41 @@ func (s *tsmom) OnKline(k types.Kline) {
 		return
 	}
 	s.barsSinceEval = 0
-
 	s.evaluate(k.Close)
+}
+
+// ForceEvaluate 实现 strategy.ForceEvaluator。
+//
+// 用途：oneshot / cron 模式下由外部触发频率代替 holding_bars 内部计数。
+// 调用者保证"现在该做决策了"，本方法只负责：喂数据 + 重置内部计数 + 评估。
+//
+// 与 OnKline 的差异：
+//   - OnKline 在持有期内会直接 return，决策 K 可能错过评估
+//   - ForceEvaluate 无视持有期计数，只要数据够就一定评估
+func (s *tsmom) ForceEvaluate(k types.Kline) {
+	s.appendClose(k.Close)
+	s.barsSinceEval = 0 // 重置，下次 OnKline 重新累计
+
+	if !s.hasEnoughData() {
+		slog.Warn("ForceEvaluate 数据不足，跳过本次评估",
+			"have", len(s.closes), "need", s.lookbackBars+1)
+		return
+	}
+	s.evaluate(k.Close)
+}
+
+// appendClose 把一根 K 线收盘价加入滚动缓存。
+// lookback * 4 的窗口对 28 日策略 = 112，绰绰有余。
+func (s *tsmom) appendClose(c float64) {
+	s.closes = append(s.closes, c)
+	if len(s.closes) > s.lookbackBars*4 {
+		s.closes = s.closes[len(s.closes)-s.lookbackBars*4:]
+	}
+}
+
+// hasEnoughData 评估所需数据是否就位：要算 lookback 期收益率至少需要 lookback+1 个 close。
+func (s *tsmom) hasEnoughData() bool {
+	return len(s.closes) >= s.lookbackBars+1
 }
 
 // evaluate 跑一次 TSMOM 评估并调仓。

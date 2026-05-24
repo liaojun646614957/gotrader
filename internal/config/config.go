@@ -51,6 +51,11 @@ type OKXConfig struct {
 	WSPublic   string `yaml:"ws_public"`
 	WSPrivate  string `yaml:"ws_private"`
 	WSBusiness string `yaml:"ws_business"` // K 线等
+	// PositionMode OKX 永续合约的持仓模式，影响下单时是否需要填 posSide。
+	//   - "net"        ：单向持仓（OKX 默认）。下单不带 posSide。
+	//   - "long_short" ：双向持仓（hedge mode）。下单必须带 posSide=long/short。
+	// 默认 "net"。和你 OKX 账户设置必须一致，否则下单会被 51000 拒掉。
+	PositionMode string `yaml:"position_mode"`
 }
 
 // RiskConfig 风控硬约束。任何字段为 0 视为未启用该项检查。
@@ -145,6 +150,11 @@ func (c *Config) applyBacktestDefaults() {
 func (c *Config) applyDefaults() {
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+	// OKX 持仓模式默认 "net"（单向持仓），跟 OKX 账户开户默认一致。
+	// 用户主动改成双向才需要在 yaml 里写 "long_short"。
+	if c.OKX.PositionMode == "" {
+		c.OKX.PositionMode = "net"
 	}
 	// REST endpoint
 	if c.OKX.RestURL == "" {

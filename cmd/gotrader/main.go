@@ -1,7 +1,15 @@
 // gotrader: OKX 量化交易主程序。
 //
-// 启动顺序：加载配置 → 构造 REST/WS 客户端 → 同步账户/持仓 →
-// 启动 WS → 跑策略主循环 → 等待信号 → SIGINT 优雅退出。
+// 两种运行模式：
+//   - 默认（常驻）：构造 REST/WS → 同步持仓 → 启动 WS → 跑事件循环直到 SIGINT。
+//     适合 5min/1m 等高频策略，或对订单回报实时性敏感的场景。
+//   - -oneshot（一次性评估）：构造 REST → 同步持仓 → 拉历史 K 线喂策略 →
+//     处理决策信号 → 退出。适合 1D + holding_bars=N 这种低频策略，外部 cron 触发。
+//
+// 用法：
+//
+//	./bin/gotrader -config config.yaml             # 常驻模式
+//	./bin/gotrader -config config.yaml -oneshot    # 一次性评估
 package main
 
 import (
@@ -23,6 +31,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	oneshot := flag.Bool("oneshot", false, "一次性评估模式：跑一次 → 处理信号 → 退出（适合 cron 触发的低频策略）")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -42,10 +51,14 @@ func main() {
 	rest := okx.NewClient(cfg.OKX.APIKey, cfg.OKX.SecretKey, cfg.OKX.Passphrase,
 		cfg.OKX.RestURL, !cfg.OKX.Live)
 
-	wsPub := okx.NewWSClient(cfg.OKX.WSPublic, false, "", "", "")
-	wsBiz := okx.NewWSClient(cfg.OKX.WSBusiness, false, "", "", "")
-	wsPriv := okx.NewWSClient(cfg.OKX.WSPrivate, true,
-		cfg.OKX.APIKey, cfg.OKX.SecretKey, cfg.OKX.Passphrase)
+	// oneshot 不需要 WS 长连接，省掉构造（也避免 oneshot 误打开端口）
+	var wsPub, wsBiz, wsPriv *okx.WSClient
+	if !*oneshot {
+		wsPub = okx.NewWSClient(cfg.OKX.WSPublic, false, "", "", "")
+		wsBiz = okx.NewWSClient(cfg.OKX.WSBusiness, false, "", "", "")
+		wsPriv = okx.NewWSClient(cfg.OKX.WSPrivate, true,
+			cfg.OKX.APIKey, cfg.OKX.SecretKey, cfg.OKX.Passphrase)
+	}
 
 	risk := engine.NewRiskGuard(cfg.Risk)
 
@@ -75,13 +88,20 @@ func main() {
 
 	notifier := notify.New(cfg.Notify)
 
-	eng := engine.New(rest, wsPub, wsBiz, wsPriv, risk, strat, stratCfg, notifier)
+	eng := engine.New(rest, wsPub, wsBiz, wsPriv, risk, strat, stratCfg, notifier, cfg.OKX.PositionMode)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := eng.Run(ctx); err != nil {
-		fatal("engine: %v", err)
+	if *oneshot {
+		slog.Info("以 oneshot 模式启动（一次性评估后退出）")
+		if err := eng.RunOnce(ctx); err != nil {
+			fatal("engine oneshot: %v", err)
+		}
+	} else {
+		if err := eng.Run(ctx); err != nil {
+			fatal("engine: %v", err)
+		}
 	}
 	slog.Info("已退出")
 }

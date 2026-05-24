@@ -31,6 +31,21 @@ type Strategy interface {
 	OnOrderUpdate(o types.Order)
 }
 
+// ForceEvaluator 可选接口。实现了这个接口的策略在 oneshot 模式下，
+// engine 会用 ForceEvaluate 取代 OnKline 喂"决策 K"，保证无论
+// 策略内部的频控计数器（如 TSMOM 的 barsSinceEval）处于什么状态，
+// 决策 K 必然触发一次完整评估并产出信号。
+//
+// 设计取舍：
+//   - 没实现这个接口的策略（比如 chan_bs）走原路径，零破坏。
+//   - 实现的策略可以把"预热期间的频控计数"清零，相当于告诉策略：
+//     "这是 oneshot 触发，cron 频率已经替你做了 holding_bars 的限频"。
+type ForceEvaluator interface {
+	// ForceEvaluate 把决策 K 喂给策略并强制评估，无视任何内部频控。
+	// 实现方需要保证：调用后如果数据充足，必然产出（或拒绝产出）一个决策。
+	ForceEvaluate(k types.Kline)
+}
+
 // Factory 创建策略实例。
 type Factory func() Strategy
 
