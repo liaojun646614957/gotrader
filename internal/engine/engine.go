@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kraus/gotrader/internal/exchange/okx"
+	"github.com/kraus/gotrader/internal/notify"
 	"github.com/kraus/gotrader/internal/strategy"
 	"github.com/kraus/gotrader/internal/types"
 )
@@ -33,6 +34,7 @@ type Engine struct {
 	risk      *RiskGuard
 	strat     strategy.Strategy
 	stratCfg  strategy.Config
+	notifier  notify.Notifier // 信号 / 下单事件的邮件通知。无配置时为 Noop。
 
 	// 市场状态缓存：最新成交价、持仓金额
 	mu             sync.RWMutex
@@ -40,9 +42,13 @@ type Engine struct {
 	positionValue  map[string]float64 // instID -> 持仓 USDT 估值
 }
 
-// New 构造 Engine。
+// New 构造 Engine。notifier 传 nil 等价于 notify.Noop{}（永远不会 panic）。
 func New(rest *okx.Client, wsPub, wsBiz, wsPriv *okx.WSClient,
-	risk *RiskGuard, strat strategy.Strategy, stratCfg strategy.Config) *Engine {
+	risk *RiskGuard, strat strategy.Strategy, stratCfg strategy.Config,
+	notifier notify.Notifier) *Engine {
+	if notifier == nil {
+		notifier = notify.Noop{}
+	}
 	return &Engine{
 		rest:          rest,
 		wsPub:         wsPub,
@@ -51,6 +57,7 @@ func New(rest *okx.Client, wsPub, wsBiz, wsPriv *okx.WSClient,
 		risk:          risk,
 		strat:         strat,
 		stratCfg:      stratCfg,
+		notifier:      notifier,
 		lastPrice:     make(map[string]float64),
 		positionValue: make(map[string]float64),
 	}
@@ -194,6 +201,10 @@ func (e *Engine) handleSignal(sig types.Signal) {
 
 	if err := e.risk.Check(sig, mark, posVal); err != nil {
 		slog.Warn("信号被风控拦截", "instId", sig.InstID, "side", sig.Side, "err", err)
+		e.notifier.Notify(
+			fmt.Sprintf("[gotrader] 信号被风控拦截 %s %s", sig.InstID, sig.Side),
+			formatSignalNotify(sig, mark, posVal, "BLOCKED", "风控拒绝："+err.Error(), "", ""),
+		)
 		return
 	}
 
@@ -218,12 +229,88 @@ func (e *Engine) handleSignal(sig types.Signal) {
 	orderID, err := e.rest.PlaceOrder(req)
 	if err != nil {
 		slog.Error("下单失败", "instId", sig.InstID, "err", err, "reason", sig.Reason)
+		e.notifier.Notify(
+			fmt.Sprintf("[gotrader] 下单失败 %s %s", sig.InstID, sig.Side),
+			formatSignalNotify(sig, mark, posVal, "FAIL", "下单失败："+err.Error(), clOID, ""),
+		)
 		return
 	}
 	slog.Info("订单已下", "instId", sig.InstID, "side", sig.Side,
 		"strategy_size", sig.Size, "okx_size", okxSize,
 		"reduceOnly", sig.ReduceOnly,
 		"price", sig.Price, "ordId", orderID, "clOID", clOID, "reason", sig.Reason)
+	e.notifier.Notify(
+		fmt.Sprintf("[gotrader] 已下单 %s %s %s", sig.InstID, describeAction(sig), sig.Side),
+		formatSignalNotify(sig, mark, posVal, "OK", "订单已提交", clOID, orderID),
+	)
+}
+
+// describeAction 把信号翻译成人话："开多" / "平多" / "开空" / "平空"。
+// 现货简化为 "买入" / "卖出"。
+func describeAction(sig types.Signal) string {
+	if sig.InstType == types.InstSpot {
+		if sig.Side == types.SideBuy {
+			return "买入"
+		}
+		return "卖出"
+	}
+	// 合约：reduceOnly 区分开/平
+	if sig.ReduceOnly {
+		if sig.Side == types.SideSell {
+			return "平多"
+		}
+		return "平空"
+	}
+	if sig.Side == types.SideBuy {
+		return "开多"
+	}
+	return "开空"
+}
+
+// formatSignalNotify 组装邮件正文。
+// status 取 OK / FAIL / BLOCKED；clOID/orderID 可为空字符串。
+func formatSignalNotify(sig types.Signal, mark, posVal float64,
+	status, detail, clOID, orderID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "状态: %s\n", status)
+	fmt.Fprintf(&b, "时间: %s\n", time.Now().Format("2006-01-02 15:04:05 -0700"))
+	fmt.Fprintf(&b, "标的: %s (%s)\n", sig.InstID, sig.InstType)
+	fmt.Fprintf(&b, "动作: %s\n", describeAction(sig))
+	fmt.Fprintf(&b, "方向: %s  持仓方向: %s\n", sig.Side, fallback(string(sig.PosSide), "-"))
+	fmt.Fprintf(&b, "类型: %s\n", sig.Type)
+	fmt.Fprintf(&b, "价格: %s\n", priceStr(sig.Price))
+	fmt.Fprintf(&b, "数量(基础币): %g\n", sig.Size)
+	fmt.Fprintf(&b, "ReduceOnly: %v\n", sig.ReduceOnly)
+	fmt.Fprintf(&b, "杠杆: %d\n", sig.Leverage)
+	fmt.Fprintf(&b, "信号原因: %s\n", fallback(sig.Reason, "-"))
+	fmt.Fprintf(&b, "\n--- 市场快照 ---\n")
+	fmt.Fprintf(&b, "最新价: %s\n", priceStr(mark))
+	fmt.Fprintf(&b, "当前持仓估值(USDT): %.2f\n", posVal)
+	if clOID != "" {
+		fmt.Fprintf(&b, "\n--- 订单 ---\n")
+		fmt.Fprintf(&b, "ClientOID: %s\n", clOID)
+		if orderID != "" {
+			fmt.Fprintf(&b, "OKX OrdID:  %s\n", orderID)
+		}
+	}
+	if detail != "" {
+		fmt.Fprintf(&b, "\n备注: %s\n", detail)
+	}
+	return b.String()
+}
+
+func priceStr(p float64) string {
+	if p == 0 {
+		return "市价"
+	}
+	return fmt.Sprintf("%g", p)
+}
+
+func fallback(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 // swapCtVal OKX 永续合约面值。1 张 = ctVal 个基础币。

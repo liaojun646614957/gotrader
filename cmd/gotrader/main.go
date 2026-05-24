@@ -16,6 +16,7 @@ import (
 	"github.com/kraus/gotrader/internal/config"
 	"github.com/kraus/gotrader/internal/engine"
 	"github.com/kraus/gotrader/internal/exchange/okx"
+	"github.com/kraus/gotrader/internal/notify"
 	"github.com/kraus/gotrader/internal/strategy"
 	"github.com/kraus/gotrader/internal/types"
 )
@@ -72,7 +73,9 @@ func main() {
 		}
 	}
 
-	eng := engine.New(rest, wsPub, wsBiz, wsPriv, risk, strat, stratCfg)
+	notifier := notify.New(cfg.Notify)
+
+	eng := engine.New(rest, wsPub, wsBiz, wsPriv, risk, strat, stratCfg, notifier)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

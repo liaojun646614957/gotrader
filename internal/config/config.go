@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/kraus/gotrader/internal/notify"
 	"gopkg.in/yaml.v3"
 )
 
 // Config 应用根配置。
 type Config struct {
-	OKX      OKXConfig      `yaml:"okx"`
-	Risk     RiskConfig     `yaml:"risk"`
-	Strategy StrategyConfig `yaml:"strategy"`
-	Backtest BacktestConfig `yaml:"backtest"`
-	LogLevel string         `yaml:"log_level"`
+	OKX      OKXConfig          `yaml:"okx"`
+	Risk     RiskConfig         `yaml:"risk"`
+	Strategy StrategyConfig     `yaml:"strategy"`
+	Backtest BacktestConfig     `yaml:"backtest"`
+	Notify   notify.SMTPConfig  `yaml:"notify"`
+	LogLevel string             `yaml:"log_level"`
 }
 
 // BacktestConfig 回测参数。仅 cmd/backtest 用，实盘程序忽略。
