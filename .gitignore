@@ -1,0 +1,29 @@
+# Binaries
+/gotrader
+/bin/
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+/logs/
+
+# Backtest outputs (回测产物：成交记录、权益图等)
+/out/
+
+# Local config (NEVER commit API keys)
+config.yaml
+config.local.yaml
+.env
+
+# Go
+vendor/

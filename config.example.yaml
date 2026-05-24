@@ -1,0 +1,128 @@
+# gotrader 配置示例。复制为 config.yaml 后填入真实值。
+#
+# 安全提醒：
+#   1. config.yaml 已加入 .gitignore，不要提交
+#   2. 在 OKX 后台创建 API Key 时关闭"提币"权限
+#   3. 设置 IP 白名单
+#   4. 先在模拟盘跑（live: false），实盘前至少跑 7 天
+
+okx:
+  api_key: "YOUR_API_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+  passphrase: "YOUR_PASSPHRASE"
+  live: false              # false=模拟盘（必须先在这里验证），true=实盘
+  # 下面的 URL 留空即按 live 自动选择 OKX 官方端点
+
+# 风控硬约束。任何一条不满足，订单直接被拒绝。
+risk:
+  max_order_value_usdt: 100      # 单笔最大 100U
+  max_position_value_usdt: 500   # 单标的最大持仓 500U
+  min_order_interval_ms: 1000    # 同标的两次下单至少间隔 1s
+  max_orders_per_minute: 30      # 全局每分钟最多 30 单
+
+# 策略配置（MVP 只跑一个）
+#
+# ====================================================================
+# 多策略选择
+# ====================================================================
+#
+# 现已注册策略：
+#   - chan_bs : 缠中说缠第 1/2 类买卖点（自由度大、5m 加密上未发现 alpha）
+#   - tsmom   : 时间序列动量（学术证据强，论文 Sharpe 1.2-1.5）
+#
+# 切换策略 = 改 strategy.name 字段 + 对应的 params。
+# 新加策略 = 在 internal/strategy/ 新建文件，init() 里 Register() 即可，
+# 不需要改 main / engine / config 任何代码。
+#
+# ====================================================================
+# 策略 1: chan_bs（缠论）
+# ====================================================================
+# 注意：90 天 BTC/ETH 回测显示无正期望值，仅作为教学参考。
+#
+# strategy:
+#   name: "chan_bs"
+#   inst_id: "BTC-USDT"
+#   inst_type: "SPOT"
+#   leverage: 0
+#   params:
+#     bar: "5m"
+#     size: 0.001
+#     confirm_bars: 2
+#     macd_fast: 12
+#     macd_slow: 26
+#     macd_signal: 9
+#     min_bi_mks: 5
+#     fractal_right_confirm: 1
+
+# ====================================================================
+# 策略 3: vmm（波动率管理动量）★ 推荐 - 论文 Barroso & Santa-Clara 2015
+# ====================================================================
+# 学术出处：
+#   - Barroso & Santa-Clara (2015 JFE) "Momentum has its moments"
+#   - Springer 2025 加密版 (s11408-025-00474-9)
+#
+# 跟 tsmom 的关键区别：
+#   - 方向决定：短期（return_lookback=7 天）
+#   - 仓位大小：长期 vol（vol_lookback=60 天）→ 更稳定
+#   - 默认无杠杆（max_scale=1.0），单笔最大亏损可控
+#   - 适合 500 USDT 这种小本金保守起步
+#
+# strategy:
+#   name: "vmm"
+#   inst_id: "ETH-USDT-SWAP"
+#   inst_type: "SWAP"
+#   leverage: 1
+#   params:
+#     bar: "1D"
+#     return_lookback: 7              # 短期动量信号（论文 1-7 天）
+#     vol_lookback: 60                # 长期 vol 估计（论文用 6 个月 ≈ 120）
+#     rebalance_bars: 7               # 周度再平衡（论文做法）
+#     target_vol_annual: 0.40         # 年化目标波动率 40%
+#     bars_per_year: 365              # 日线
+#     base_position_usd: 500          # = 初始资金（无杠杆）
+#     max_scale: 1.0                  # 不允许超过 100% 仓位
+
+# ====================================================================
+# 策略 2: tsmom（时间序列动量）★ 推荐
+# ====================================================================
+# 学术出处：Moskowitz/Ooi/Pedersen (2012 JFE), Han et al. (2024)
+# 论文最优参数：lookback=28, holding=5，日线，加密上 Sharpe 1.51
+#
+# 关键设计：
+#   - 简单 sign(过去N天收益) 决定方向
+#   - 波动率缩放：高波动期自动缩仓，低波动期加仓
+#   - 没有"分型/笔/中枢"那套结构识别，直接看价格涨跌
+#   - bars_per_year 必须跟 bar 周期对齐：5m=105120, 1H=8760, 1D=365
+strategy:
+  name: "tsmom"
+  inst_id: "BTC-USDT-SWAP"
+  inst_type: "SWAP"
+  leverage: 3
+  params:
+    bar: "1D"                       # 论文用日线
+    lookback_bars: 28               # 回看 28 根 K 线
+    holding_bars: 5                 # 每 5 根再平衡一次
+    target_vol_annual: 0.40         # 年化目标波动率 40%
+    bars_per_year: 365              # 日线 365；1H=8760；5m=105120
+    base_position_usd: 1500         # 基准仓位 USD（500 USDT × 3x）
+    max_scale: 3.0                  # 波动率缩放上限（防低波动期仓位失控）
+
+# 回测参数（仅 bin/backtest 用，实盘程序忽略）
+#
+# 跑法：./bin/backtest -config config.yaml
+#       ./bin/backtest -config config.yaml -bars 2000 -verbose
+backtest:
+  bars: 1000                     # 拉取 K 线根数（OKX 历史接口公开，无需 API key）
+  fee_rate: 0.0005               # 单边手续费率（OKX 永续 taker 0.05%，现货 0.1%）
+  init_equity: 500               # 初始资金 USDT
+  leverage: 0                    # >0 + signal.Size=0 时启用自动全仓（chan_bs 用，tsmom 不需要）
+  stop_loss_pct: 0               # 单笔反向 N% 强平（tsmom 持仓久，建议设 0；chan_bs 建议 0.03）
+  max_drawdown_pct: 0            # 账户回撤 N% 停机（tsmom 设 0，让策略自己跑；chan_bs 建议 0.20）
+  recover_after_bars: 0          # 停机后 N 根 K 线恢复（0=永不恢复）
+  verbose: false                 # true 时打印每笔成交（信号多时刷屏）
+  trades_csv: ""                 # 非空：成交明细 CSV（事后用 Excel/Python 分析）
+  equity_csv: ""                 # 非空：权益曲线 CSV（time/equity/price/bh_equity）
+  equity_png: ""                 # 非空：权益曲线 PNG（一张图看清策略 vs 买入持有）
+  end_time: ""                   # 可选，回测截止日期 YYYY-MM-DD，空=至今
+
+log_level: "info"                # debug / info / warn / error
