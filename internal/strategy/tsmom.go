@@ -57,6 +57,10 @@ type tsmom struct {
 	barsPerYear     float64 // 一年有多少根 K 线（5m=105120, 1H=8760, 1D=365）
 	basePositionUSD float64 // 基准名义仓位（USDT），实际仓位会按 vol scale 上下浮动
 	maxScale        float64 // vol scale 的上限（防止低波动期仓位失控）
+	// resizeThreshold 同方向调仓阈值：目标仓位相对当前持仓漂移超过此比例才调仓。
+	// 这是 vol scaling 真正生效的开关——没有它，方向不变时波动率缩放永远不落地。
+	// 设阈值是为了避免每个周期都因 size 微小变化而频繁调仓白交手续费。
+	resizeThreshold float64
 	allowShort      bool
 
 	closes []float64 // 滚动保存收盘价（用于算 return 和 vol）
@@ -66,6 +70,10 @@ type tsmom struct {
 
 	// 当前持仓状态。同 chan_bs 的 pos 枚举。
 	state pos
+
+	// 当前持仓的基础币数量（策略视角）。用于同方向 vol-scaling 调仓时算漂移。
+	// 开仓时记为目标量，平仓/被外部平掉时归零。
+	curQty float64
 }
 
 func (s *tsmom) Init(cfg Config, signals chan<- types.Signal) error {
@@ -77,6 +85,7 @@ func (s *tsmom) Init(cfg Config, signals chan<- types.Signal) error {
 	s.barsPerYear = paramFloat(cfg.Params, "bars_per_year", 365)
 	s.basePositionUSD = paramFloat(cfg.Params, "base_position_usd", 1000)
 	s.maxScale = paramFloat(cfg.Params, "max_scale", 3.0)
+	s.resizeThreshold = paramFloat(cfg.Params, "resize_threshold", 0.25)
 	s.allowShort = cfg.InstType == types.InstSwap || cfg.InstType == types.InstFutures
 
 	slog.Info("TSMOM 策略已初始化",
@@ -86,6 +95,7 @@ func (s *tsmom) Init(cfg Config, signals chan<- types.Signal) error {
 		"target_vol_annual", s.targetVolAnnual,
 		"bars_per_year", s.barsPerYear,
 		"base_position_usd", s.basePositionUSD,
+		"resize_threshold", s.resizeThreshold,
 		"allow_short", s.allowShort,
 	)
 	return nil
@@ -198,27 +208,55 @@ func (s *tsmom) evaluate(curPrice float64) {
 
 // rebalance 把当前持仓调整到目标方向 + 目标数量。
 //
-// 状态机消除特殊情况（FLAT/LONG/SHORT 同一处理路径）：
-//   - 当前 != 目标方向：先平再开
-//   - 目标 = FLAT：仅平仓
-//   - 当前 == 目标方向 + size 变化：MVP 不做调仓（避免频繁手续费），等下次周期
+// 统一路径（消除特殊情况）：是否动作只有一处判断，动作只有"先平后开"一条路。
+//   - 方向变了                              → 平掉旧仓 + 开出新仓
+//   - 同方向但目标 size 漂移超 resizeThreshold → 平掉旧仓 + 按新 size 重开（vol scaling 在此落地）
+//   - 同方向且 size 漂移很小                  → 什么都不做，省手续费
+//   - 目标 = FLAT                           → 只平仓
+//
+// ⚠️ 为什么用"先全平再重开"而不是"增量加减仓"：
+//
+//	回测 runner 把 Signal.Size 当作"目标绝对持仓"（delta 模型），
+//	实盘 engine 把 Signal.Size 当作"本次下单增量张数"直接发给 OKX。
+//	两种语义只有在两个动作上才一致：
+//	    1. 从空仓开到 target（增量 == 目标）
+//	    2. ReduceOnly 平到 0（两边都是全平）
+//	"先平后开"全程只用这两个动作，所以回测和实盘行为一致。
+//	若改用"增量减仓"，回测会按"目标"解读而算错持仓——回测对、实盘错的灾难。
+//	代价：调仓多付一次手续费。但低频(holding_bars) + 阈值下每年成本 <1%，可接受。
 func (s *tsmom) rebalance(dir pos, targetQty float64) {
-	if dir == s.state {
-		// 同方向：MVP 不做"动态加减仓"，等下次评估周期
+	sameDir := dir == s.state
+	if sameDir && (dir == posFlat || !s.sizeDriftExceeds(targetQty)) {
+		return // 方向没变且仓位无需调整
+	}
+	// 先平掉与目标不符的现有仓位（如有），再开出目标仓位（如非空仓）。
+	s.closeIfAny()
+	if dir != posFlat {
+		s.open(dir, targetQty)
+	}
+}
+
+// sizeDriftExceeds 判断目标仓位相对当前持仓的漂移是否大到需要调仓。
+// curQty<=0 时返回 true（保证总能开出仓位；正常同方向流程里 curQty 必 >0）。
+func (s *tsmom) sizeDriftExceeds(targetQty float64) bool {
+	if s.curQty <= 0 {
+		return true
+	}
+	return math.Abs(targetQty-s.curQty)/s.curQty > s.resizeThreshold
+}
+
+// closeIfAny 平掉当前仓位（如有），并把 state/curQty 重置为空仓。
+func (s *tsmom) closeIfAny() {
+	if s.state == posFlat {
 		return
 	}
+	s.emitClose()
+	s.state = posFlat
+	s.curQty = 0
+}
 
-	// 先平（如果有仓）
-	if s.state != posFlat {
-		s.emitClose()
-		s.state = posFlat
-	}
-
-	if dir == posFlat {
-		return
-	}
-
-	// 开新仓
+// open 从空仓开出 targetQty 的新仓，记录 state/curQty。调用前必须已空仓。
+func (s *tsmom) open(dir pos, targetQty float64) {
 	side := types.SideBuy
 	if dir == posShort {
 		side = types.SideSell
@@ -234,9 +272,15 @@ func (s *tsmom) rebalance(dir pos, targetQty float64) {
 		Reason:     "tsmom 开仓",
 	}
 	s.state = dir
+	s.curQty = targetQty
 }
 
 // emitClose 发反向 ReduceOnly 信号平掉当前仓。
+//
+// Size 用 curQty（当前持仓量的策略估计）：
+//   - 回测 runner 看到 ReduceOnly=true 直接把目标设为 0 全平，无视 Size。
+//   - 实盘 OKX 按此量 ReduceOnly 平仓；ReduceOnly 保证不会反向开仓，
+//     即使 curQty 略大于真实持仓，OKX 也只会平到 0 为止。
 func (s *tsmom) emitClose() {
 	var side types.Side
 	var ps types.PosSide
@@ -256,12 +300,9 @@ func (s *tsmom) emitClose() {
 		Side:       side,
 		PosSide:    ps,
 		Type:       types.OrderMarket,
-		// Size=0 让 runner 用当前持仓量平掉。但我们这里其实知道精确量，
-		// 简化：用一个足够大的 size，runner 的 ReduceOnly 逻辑会把目标限到 0。
-		// 实际 runner.targetQty 看到 ReduceOnly=true 直接返回 0，所以 Size 字段无所谓。
-		Size:       1,
+		Size:       s.curQty,
 		ReduceOnly: true,
-		Reason:     "tsmom 换向平仓",
+		Reason:     "tsmom 平仓",
 	}
 }
 
@@ -276,6 +317,7 @@ func (s *tsmom) OnOrderUpdate(o types.Order) {
 			"reason", o.Reason,
 		)
 		s.state = posFlat
+		s.curQty = 0
 	}
 }
 

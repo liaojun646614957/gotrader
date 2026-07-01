@@ -178,3 +178,79 @@ func TestVMM_VolScaling(t *testing.T) {
 	t.Logf("低波动 size=%.4f, 高波动 size=%.4f (比例 %.1fx)",
 		lowSize, hiSize, lowSize/hiSize)
 }
+
+func newVMMForResize(t *testing.T) (*vmm, chan types.Signal) {
+	t.Helper()
+	s := &vmm{}
+	sigs := make(chan types.Signal, 256)
+	cfg := Config{
+		InstID:   "ETH-USDT-SWAP",
+		InstType: types.InstSwap,
+		Params: map[string]interface{}{
+			"return_lookback":   7,
+			"vol_lookback":      20,
+			"rebalance_bars":    1,
+			"target_vol_annual": 0.40,
+			"bars_per_year":     365.0,
+			"base_position_usd": 1000.0,
+			"max_scale":         3.0,
+			"resize_threshold":  0.25,
+		},
+	}
+	if err := s.Init(cfg, sigs); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	return s, sigs
+}
+
+// feedClosesVMM 复用 tsmom_test 里的 genSeries，但喂给 *vmm。
+func feedClosesVMM(s *vmm, closes []float64) {
+	for _, c := range closes {
+		s.OnKline(types.Kline{InstID: "ETH-USDT-SWAP", Open: c, High: c, Low: c, Close: c})
+	}
+}
+
+// TestVMM_VolScalingResizesSameDirection 覆盖与 tsmom 相同的核心 bug：
+// 方向不变、波动率升高导致目标仓位显著缩小时，VMM 必须真的减仓。
+// 旧实现里 rebalance 对同方向直接 return，这个测试会失败。
+func TestVMM_VolScalingResizesSameDirection(t *testing.T) {
+	s, sigs := newVMMForResize(t)
+
+	// 阶段1：低波动缓涨 → 多头 + 高 scale(撞 cap=3) → 大仓位
+	feedClosesVMM(s, genSeries(100, 0.003, 0.002, 40))
+	openSize1, ok := lastOpenSize(drainSignalsTest(sigs))
+	if !ok {
+		t.Fatalf("阶段1 应开多仓，却没有开仓信号")
+	}
+
+	// 阶段2：高波动继续上涨 → 仍多头，但 annVol 飙升 → scale 变小 → 目标仓位显著缩小
+	feedClosesVMM(s, genSeries(s.closes[len(s.closes)-1], 0.015, 0.04, 40))
+	closes, opens := splitSignals(drainSignalsTest(sigs))
+
+	if len(closes) == 0 || len(opens) == 0 {
+		t.Fatalf("波动率升高应触发同方向减仓(先平后开)，实际 closes=%d opens=%d。"+
+			"vol scaling 没生效。", len(closes), len(opens))
+	}
+	openSize2 := opens[len(opens)-1].Size
+	if openSize2 >= openSize1 {
+		t.Fatalf("高波动应缩仓：openSize2=%.4f 应 < openSize1=%.4f", openSize2, openSize1)
+	}
+	if closes[0].Size <= 0 {
+		t.Errorf("平仓 Size 应为正的持仓量, got %.4f", closes[0].Size)
+	}
+	t.Logf("vol scaling 生效：低波动仓位 %.4f → 高波动仓位 %.4f", openSize1, openSize2)
+}
+
+// TestVMM_NoResizeOnSmallDrift 回归保护：同方向且 size 漂移很小时不应频繁调仓。
+func TestVMM_NoResizeOnSmallDrift(t *testing.T) {
+	s, sigs := newVMMForResize(t)
+
+	feedClosesVMM(s, genSeries(100, 0.003, 0.002, 40)) // 低波动建多仓(撞 cap)
+	_ = drainSignalsTest(sigs)
+
+	feedClosesVMM(s, genSeries(s.closes[len(s.closes)-1], 0.003, 0.002, 12))
+	after := drainSignalsTest(sigs)
+	if len(after) != 0 {
+		t.Fatalf("小漂移不应调仓，却收到 %d 个信号: %+v", len(after), after)
+	}
+}

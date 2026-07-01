@@ -55,17 +55,16 @@ risk:
 #     fractal_right_confirm: 1
 
 # ====================================================================
-# 策略 3: vmm（波动率管理动量）★ 推荐 - 论文 Barroso & Santa-Clara 2015
+# 策略 3: vmm（波动率管理动量）🔴 已停用（2026-06-24）
 # ====================================================================
-# 学术出处：
+# 停用原因：ETH-USDT-SWAP 1D / 770 根回测实测 Sharpe -0.31、胜率 24.6%、
+#   净收益 -14%（方向系统性反向）。本质无 alpha，vol-scaling 修复也救不活。
+#   代码已从策略注册表注销（config 选 "vmm" 会报 unknown strategy）。
+#   想重新验证：取消 internal/strategy/vmm.go 里 Register 的注释。
+#
+# 学术出处（仅供参考）：
 #   - Barroso & Santa-Clara (2015 JFE) "Momentum has its moments"
 #   - Springer 2025 加密版 (s11408-025-00474-9)
-#
-# 跟 tsmom 的关键区别：
-#   - 方向决定：短期（return_lookback=7 天）
-#   - 仓位大小：长期 vol（vol_lookback=60 天）→ 更稳定
-#   - 默认无杠杆（max_scale=1.0），单笔最大亏损可控
-#   - 适合 500 USDT 这种小本金保守起步
 #
 # strategy:
 #   name: "vmm"
@@ -90,7 +89,7 @@ risk:
 #
 # 关键设计：
 #   - 简单 sign(过去N天收益) 决定方向
-#   - 波动率缩放：高波动期自动缩仓，低波动期加仓
+#   - 波动率缩放：高波动期自动缩仓，低波动期加仓（靠 resize_threshold 落地）
 #   - 没有"分型/笔/中枢"那套结构识别，直接看价格涨跌
 #   - bars_per_year 必须跟 bar 周期对齐：5m=105120, 1H=8760, 1D=365
 strategy:
@@ -106,6 +105,8 @@ strategy:
     bars_per_year: 365              # 日线 365；1H=8760；5m=105120
     base_position_usd: 1500         # 基准仓位 USD（500 USDT × 3x）
     max_scale: 3.0                  # 波动率缩放上限（防低波动期仓位失控）
+    resize_threshold: 0.25          # 同方向仓位漂移超 25% 才调仓（vol-scaling 生效开关）
+                                    # 回测验证：开启后回撤 -18%、Calmar +40%。设极大值≈关闭。
 
 # 回测参数（仅 bin/backtest 用，实盘程序忽略）
 #

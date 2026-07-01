@@ -171,3 +171,129 @@ func TestTSMOM_VolatilityScaling(t *testing.T) {
 	t.Logf("低波动 size=%.4f, 高波动 size=%.4f, 比例 %.2fx",
 		lowSize, hiSize, lowSize/hiSize)
 }
+
+// genSeries 生成"趋势 + 锯齿噪声"的收盘价序列。
+// drift 控制每步上涨幅度，amp 控制相邻摆动（即波动率）。
+func genSeries(start, drift, amp float64, n int) []float64 {
+	out := make([]float64, n)
+	p := start
+	for i := 0; i < n; i++ {
+		p *= 1 + drift
+		jitter := amp
+		if i%2 == 1 {
+			jitter = -amp
+		}
+		out[i] = p * (1 + jitter)
+	}
+	return out
+}
+
+func feedCloses(s *tsmom, closes []float64) {
+	for _, c := range closes {
+		s.OnKline(types.Kline{InstID: "ETH-USDT-SWAP", Open: c, High: c, Low: c, Close: c})
+	}
+}
+
+func splitSignals(sigs []types.Signal) (closes, opens []types.Signal) {
+	for _, sg := range sigs {
+		if sg.ReduceOnly {
+			closes = append(closes, sg)
+		} else {
+			opens = append(opens, sg)
+		}
+	}
+	return
+}
+
+func drainSignalsTest(ch chan types.Signal) []types.Signal {
+	var out []types.Signal
+	for {
+		select {
+		case sg := <-ch:
+			out = append(out, sg)
+		default:
+			return out
+		}
+	}
+}
+
+func newTSMOMForResize(t *testing.T) (*tsmom, chan types.Signal) {
+	t.Helper()
+	s := &tsmom{}
+	sigs := make(chan types.Signal, 256)
+	cfg := Config{
+		InstID:   "ETH-USDT-SWAP",
+		InstType: types.InstSwap,
+		Params: map[string]interface{}{
+			"lookback_bars":     10,
+			"holding_bars":      1,
+			"target_vol_annual": 0.40,
+			"bars_per_year":     365.0,
+			"base_position_usd": 1000.0,
+			"max_scale":         3.0,
+			"resize_threshold":  0.25,
+		},
+	}
+	if err := s.Init(cfg, sigs); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	return s, sigs
+}
+
+// TestTSMOM_VolScalingResizesSameDirection 覆盖此前没人测到的核心 bug：
+// 方向不变、但波动率升高导致目标仓位显著缩小时，策略必须真的减仓。
+//
+// 旧实现里 rebalance 对同方向直接 return，vol scaling 名存实亡——
+// 这个测试在旧代码上会失败（阶段2 收不到任何信号）。
+func TestTSMOM_VolScalingResizesSameDirection(t *testing.T) {
+	s, sigs := newTSMOMForResize(t)
+
+	// 阶段1：低波动缓涨 → 多头 + 高 scale(撞 cap=3) → 大仓位
+	feedCloses(s, genSeries(100, 0.003, 0.002, 30))
+	openSize1, ok := lastOpenSize(drainSignalsTest(sigs))
+	if !ok {
+		t.Fatalf("阶段1 应开多仓，却没有开仓信号")
+	}
+
+	// 阶段2：高波动继续上涨 → 仍多头，但 annVol 飙升 → scale 变小 → 目标仓位显著缩小
+	feedCloses(s, genSeries(s.closes[len(s.closes)-1], 0.015, 0.04, 30))
+	closes, opens := splitSignals(drainSignalsTest(sigs))
+
+	if len(closes) == 0 || len(opens) == 0 {
+		t.Fatalf("波动率升高应触发同方向减仓(先平后开)，实际 closes=%d opens=%d。"+
+			"vol scaling 没生效。", len(closes), len(opens))
+	}
+	openSize2 := opens[len(opens)-1].Size
+	if openSize2 >= openSize1 {
+		t.Fatalf("高波动应缩仓：openSize2=%.4f 应 < openSize1=%.4f", openSize2, openSize1)
+	}
+	// 平仓信号的 Size 应等于平仓前的持仓量（curQty），不是写死的 1
+	if closes[0].Size <= 0 {
+		t.Errorf("平仓 Size 应为正的持仓量, got %.4f", closes[0].Size)
+	}
+	t.Logf("vol scaling 生效：低波动仓位 %.4f → 高波动仓位 %.4f", openSize1, openSize2)
+}
+
+// TestTSMOM_NoResizeOnSmallDrift 回归保护：同方向且 size 漂移很小时不应频繁调仓，
+// 否则手续费会被无意义的微调吃掉。
+func TestTSMOM_NoResizeOnSmallDrift(t *testing.T) {
+	s, sigs := newTSMOMForResize(t)
+
+	feedCloses(s, genSeries(100, 0.003, 0.002, 30)) // 低波动建多仓(撞 cap)
+	_ = drainSignalsTest(sigs)
+
+	// 再喂一段几乎同样的低波动 → scale 仍撞 cap，目标 size 几乎不变 → 不应有新信号
+	feedCloses(s, genSeries(s.closes[len(s.closes)-1], 0.003, 0.002, 12))
+	after := drainSignalsTest(sigs)
+	if len(after) != 0 {
+		t.Fatalf("小漂移不应调仓，却收到 %d 个信号: %+v", len(after), after)
+	}
+}
+
+func lastOpenSize(sigs []types.Signal) (float64, bool) {
+	_, opens := splitSignals(sigs)
+	if len(opens) == 0 {
+		return 0, false
+	}
+	return opens[len(opens)-1].Size, true
+}
