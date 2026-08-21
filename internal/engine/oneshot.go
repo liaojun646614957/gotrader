@@ -218,14 +218,15 @@ func baseCcyOf(instID string) string {
 // syncStrategyToActualPosition 把策略的内部持仓 state 对齐到交易所真实持仓。
 // 返回 longQty, shortQty（OKX 张数）供 oneshot 决策汇总打印。
 //
-// 实现方式：注入一个"假的已成交订单"事件给 strat.OnOrderUpdate。
+// 两种情形：
 //   - 真实持仓 = 0    → 注入 ReduceOnly+Filled 事件，触发策略把 state 重置为 FLAT
 //                       （tsmom / chan_bs 都在 OnOrderUpdate 里实现了这个逻辑）
-//   - 真实持仓 != 0   → V1 暂不强制覆盖（策略从预热数据推导出的方向"大概率"和真实一致）。
-//                       V2 应该加 strategy.SyncPosition(side, qty) 接口正式做这件事。
+//   - 真实持仓 != 0   → 若策略实现了 PositionSyncer，用真实方向 + 数量强制覆盖其 state；
+//                       否则退回"沿用预热推导值"（可能与真实持仓方向相反，见下）。
 //
-// 这个 hack 只解决最常见的"账户为空 + 策略以为有仓"的情形——也就是 oneshot 第一次跑、
-// 或上一次 oneshot 平了仓还没开新仓的场景。
+// 为什么真实持仓非零也必须对齐：预热推导的方向可能和账户真实持仓相反
+// （如推导 SHORT、实际 LONG），策略会以为要"平掉 SHORT"而发同方向 reduce-only，
+// 被 OKX 51170 拒单。SyncPosition 把 state/curQty 钉到真相上，从根上消除这个问题。
 func (e *Engine) syncStrategyToActualPosition() (longQty, shortQty float64, err error) {
 	positions, err := e.rest.GetPositions("")
 	if err != nil {
@@ -266,10 +267,28 @@ func (e *Engine) syncStrategyToActualPosition() (longQty, shortQty float64, err 
 		return longQty, shortQty, nil
 	}
 
-	slog.Info("交易所有真实持仓，策略 state 沿用预热推导值",
-		"instId", e.stratCfg.InstID,
-		"long_qty", longQty,
-		"short_qty", shortQty,
-	)
+	// 真实持仓非零：把策略 state 对齐到真实方向 + 数量，纠正预热推导的错误方向。
+	dir := types.PosLong
+	contracts := longQty
+	if shortQty > 0 {
+		dir, contracts = types.PosShort, shortQty
+	}
+	if syncer, ok := e.strat.(strategy.PositionSyncer); ok {
+		baseQty := contractsToBaseQty(e.stratCfg.InstID, contracts)
+		syncer.SyncPosition(dir, baseQty)
+		slog.Info("已把策略 state 对齐到交易所真实持仓",
+			"instId", e.stratCfg.InstID,
+			"dir", dir,
+			"base_qty", baseQty,
+			"long_qty", longQty,
+			"short_qty", shortQty,
+		)
+	} else {
+		slog.Info("策略未实现 PositionSyncer，state 沿用预热推导值（可能与真实持仓不一致）",
+			"instId", e.stratCfg.InstID,
+			"long_qty", longQty,
+			"short_qty", shortQty,
+		)
+	}
 	return longQty, shortQty, nil
 }

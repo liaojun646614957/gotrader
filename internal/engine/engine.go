@@ -121,8 +121,8 @@ func (e *Engine) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("get positions: %w", err)
 	}
 	for _, p := range positions {
-		// 用开仓均价估算持仓 USDT 金额。后续行情来了会用 lastPrice 更新。
-		e.positionValue[p.InstID] = p.Size * p.AvgPrice
+		// 用开仓均价估算持仓 USDT 金额（张数 → 名义 USDT，必须乘 ctVal）。
+		e.positionValue[p.InstID] = notionalUSDT(p.InstID, p.Size, p.AvgPrice)
 	}
 	slog.Info("账户同步完成", "positions", len(positions))
 	return nil
@@ -188,7 +188,7 @@ func (e *Engine) handleEvent(ev okx.WSEvent) {
 		e.strat.OnOrderUpdate(*ev.Order)
 		// 持仓金额跟踪：成交后更新（粗略估算，精确值靠 GetPositions 同步）
 		if ev.Order.Status == types.StatusFilled || ev.Order.Status == types.StatusPartiallyFilled {
-			delta := ev.Order.FilledSize * ev.Order.AvgPrice
+			delta := notionalUSDT(ev.Order.InstID, ev.Order.FilledSize, ev.Order.AvgPrice)
 			if ev.Order.Side == types.SideSell {
 				delta = -delta
 			}
@@ -353,6 +353,30 @@ var swapCtVal = map[string]float64{
 	"AVAX-USDT-SWAP": 1.0,
 	"MATIC-USDT-SWAP": 10.0,
 	"TRX-USDT-SWAP":  1000.0,
+}
+
+// notionalUSDT 把 OKX 的"张数"折算成名义 USDT：张数 × 合约面值 × 价格。
+//
+// 这是持仓/成交估值的唯一入口——bootstrap 同步和成交回报都必须走它，
+// 否则"张 × 价格"会漏乘 ctVal，估值虚高 1/ctVal 倍（ETH 是 10 倍），
+// 直接污染风控的持仓上限判断。现货 / 未知合约退化 1:1（ct=1）。
+func notionalUSDT(instID string, contracts, price float64) float64 {
+	ct, ok := swapCtVal[instID]
+	if !ok {
+		ct = 1
+	}
+	return contracts * ct * price
+}
+
+// contractsToBaseQty 把 OKX 张数折算成基础币数量：张数 × 合约面值。
+// 与 notionalUSDT 对称，用于把交易所持仓（张）传给策略（策略 curQty 按基础币记）。
+// 现货 / 未知合约退化 1:1（ct=1）。
+func contractsToBaseQty(instID string, contracts float64) float64 {
+	ct, ok := swapCtVal[instID]
+	if !ok {
+		ct = 1
+	}
+	return contracts * ct
 }
 
 // convertToOKXSize 把策略层的"基础币数量"转换成 OKX 接受的"张数"。

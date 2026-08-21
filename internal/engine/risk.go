@@ -63,7 +63,9 @@ func (r *RiskGuard) Check(sig types.Signal, markPrice, positionValueUSDT float64
 		}
 	}
 
-	if r.cfg.MinOrderIntervalMS > 0 {
+	// 最小下单间隔只节流"开仓/加仓"（新增风险）。平仓(reduce-only)是降风险动作，
+	// 永远不该被节流——否则"先平后开"翻向时，开仓单会被它前面刚发的平仓单卡住。
+	if r.cfg.MinOrderIntervalMS > 0 && !sig.ReduceOnly {
 		if last, ok := r.lastOrderAt[sig.InstID]; ok {
 			elapsed := now.Sub(last).Milliseconds()
 			if elapsed < r.cfg.MinOrderIntervalMS {
@@ -89,8 +91,12 @@ func (r *RiskGuard) Check(sig types.Signal, markPrice, positionValueUSDT float64
 		}
 	}
 
-	// 通过 -> 记账
-	r.lastOrderAt[sig.InstID] = now
+	// 通过 -> 记账。
+	// 频率窗口计入所有订单（交易所限频不区分开/平）。
 	r.orderTimes = append(r.orderTimes, now)
+	// 最小间隔只用开仓/加仓打点；平仓不打点，避免卡住紧随其后的翻向开仓单。
+	if !sig.ReduceOnly {
+		r.lastOrderAt[sig.InstID] = now
+	}
 	return nil
 }

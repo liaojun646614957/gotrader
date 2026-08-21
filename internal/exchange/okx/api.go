@@ -14,6 +14,7 @@ import (
 // =====================================================================
 
 // rawKline OKX 返回的 K 线是 string 数组：[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+// confirm: "0"=尚未收盘，"1"=已收盘。策略决策只能使用 confirm=1。
 type rawKline [9]string
 
 // GetKlines 拉取最近的 K 线。bar 例: "1m" / "5m" / "1H" / "1D"。limit 默认 100，最大 300。
@@ -91,6 +92,12 @@ func (c *Client) fetchKlines(path, instID, bar string, limit int, after int64) (
 	}
 	out := make([]types.Kline, 0, len(raws))
 	for _, r := range raws {
+		// OKX 的 candles/history-candles 都可能返回当前尚未收盘的 K 线。
+		// 盘中 close 持续变化；若拿它做 TSMOM 决策，重复运行 oneshot 会在零轴附近
+		// 反复翻多/翻空。这里只保留已确认收盘的数据，调用方无需重复判断。
+		if r[8] != "1" {
+			continue
+		}
 		ts, _ := strconv.ParseInt(r[0], 10, 64)
 		o, _ := strconv.ParseFloat(r[1], 64)
 		h, _ := strconv.ParseFloat(r[2], 64)
@@ -116,10 +123,10 @@ func (c *Client) fetchKlines(path, instID, bar string, limit int, after int64) (
 
 type rawBalanceResp struct {
 	Details []struct {
-		Ccy     string `json:"ccy"`
-		AvailEq string `json:"availEq"`
+		Ccy       string `json:"ccy"`
+		AvailEq   string `json:"availEq"`
 		FrozenBal string `json:"frozenBal"`
-		Eq      string `json:"eq"`
+		Eq        string `json:"eq"`
 	} `json:"details"`
 }
 
@@ -313,21 +320,21 @@ func (c *Client) GetOrder(instID, orderID, clientOID string) (*types.Order, erro
 }
 
 type rawOrder struct {
-	InstID    string `json:"instId"`
-	InstType  string `json:"instType"`
-	OrdID     string `json:"ordId"`
-	ClOrdID   string `json:"clOrdId"`
-	Side      string `json:"side"`
-	PosSide   string `json:"posSide"`
-	OrdType   string `json:"ordType"`
-	Px        string `json:"px"`
-	Sz        string `json:"sz"`
-	State     string `json:"state"`
-	FillSz    string `json:"fillSz"`
-	AvgPx     string `json:"avgPx"`
-	Lever     string `json:"lever"`
-	CTime     string `json:"cTime"`
-	UTime     string `json:"uTime"`
+	InstID   string `json:"instId"`
+	InstType string `json:"instType"`
+	OrdID    string `json:"ordId"`
+	ClOrdID  string `json:"clOrdId"`
+	Side     string `json:"side"`
+	PosSide  string `json:"posSide"`
+	OrdType  string `json:"ordType"`
+	Px       string `json:"px"`
+	Sz       string `json:"sz"`
+	State    string `json:"state"`
+	FillSz   string `json:"fillSz"`
+	AvgPx    string `json:"avgPx"`
+	Lever    string `json:"lever"`
+	CTime    string `json:"cTime"`
+	UTime    string `json:"uTime"`
 }
 
 func (r *rawOrder) toOrder() *types.Order {

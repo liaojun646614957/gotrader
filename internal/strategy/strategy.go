@@ -46,6 +46,21 @@ type ForceEvaluator interface {
 	ForceEvaluate(k types.Kline)
 }
 
+// PositionSyncer 可选接口：把策略内部持仓 state 强制对齐到交易所真实持仓。
+//
+// 为什么需要：oneshot 模式没有 WS 订单回报，策略只能靠预热 K 线"推导"出一个
+// state。这个推导方向可能和账户真实持仓相反（比如推导 SHORT、实际 LONG），
+// 导致策略以为要"平掉一个 SHORT"而发出同方向 reduce-only，被 OKX 51170 拒单。
+//
+// 实现了本接口的策略，engine 在 oneshot 启动时会用真实持仓的方向 + 数量覆盖其 state。
+// 没实现的策略（如 chan_bs）走原路径，零破坏。
+type PositionSyncer interface {
+	// SyncPosition 把策略 state 设为 dir 方向、baseQty 基础币数量。
+	// dir 为 types.PosLong / types.PosShort 表示有仓，其它值视为空仓。
+	// baseQty 是基础币数量（如 ETH），不是张数——调用方需先按 ctVal 换算。
+	SyncPosition(dir types.PosSide, baseQty float64)
+}
+
 // Factory 创建策略实例。
 type Factory func() Strategy
 

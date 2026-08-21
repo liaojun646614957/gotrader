@@ -321,6 +321,25 @@ func (s *tsmom) OnOrderUpdate(o types.Order) {
 	}
 }
 
+// SyncPosition 实现 PositionSyncer：把 state/curQty 强制对齐到交易所真实持仓。
+// oneshot 启动时调用，纠正预热推导出的错误方向，避免发出反向 reduce-only。
+func (s *tsmom) SyncPosition(dir types.PosSide, baseQty float64) {
+	prev := s.state
+	switch dir {
+	case types.PosLong:
+		s.state, s.curQty = posLong, baseQty
+	case types.PosShort:
+		s.state, s.curQty = posShort, baseQty
+	default:
+		s.state, s.curQty = posFlat, 0
+	}
+	slog.Info("TSMOM state 对齐到真实持仓",
+		"prevState", stateName(prev),
+		"newState", stateName(s.state),
+		"baseQty", s.curQty,
+	)
+}
+
 // stdOfReturns 计算"相邻 K 线收益率序列"的样本标准差。
 //
 // 输入 prices 长度 n，输出长度 n-1 的收益率的标准差。

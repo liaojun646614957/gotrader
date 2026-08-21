@@ -286,3 +286,22 @@ func (s *vmm) OnOrderUpdate(o types.Order) {
 		s.curQty = 0
 	}
 }
+
+// SyncPosition 实现 PositionSyncer：把 state/curQty 强制对齐到交易所真实持仓。
+// oneshot 启动时调用，纠正预热推导出的错误方向，避免发出反向 reduce-only。
+func (s *vmm) SyncPosition(dir types.PosSide, baseQty float64) {
+	prev := s.state
+	switch dir {
+	case types.PosLong:
+		s.state, s.curQty = posLong, baseQty
+	case types.PosShort:
+		s.state, s.curQty = posShort, baseQty
+	default:
+		s.state, s.curQty = posFlat, 0
+	}
+	slog.Info("VMM state 对齐到真实持仓",
+		"prevState", stateName(prev),
+		"newState", stateName(s.state),
+		"baseQty", s.curQty,
+	)
+}
